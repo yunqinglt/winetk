@@ -1,0 +1,16 @@
+# Local upstream checkouts, build trees and downloaded dependencies.
+/sources/
+/downloads/
+/build/
+/build-*/
+# Executables, private prefixes, game data and acceptance artifacts.
+/out/
+/prefixes/
+/logs/
+/game/
+/winetk-demo.jsonl
+# Python and editor-generated files.
+__pycache__/
+*.pyc
+.venv/
+.DS_Store

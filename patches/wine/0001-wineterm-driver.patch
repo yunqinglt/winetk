@@ -1,0 +1,1301 @@
+WineTk terminal GDI, surfaceless OpenGL and opt-in Steam bridge
+
+Base-Wine-Version: 11.19
+Base-Wine-Commit: 455e3509b98a6919fd4ad1def4803e08c41c03b2
+
+diff --git a/configure b/configure
+index e73491f3289e2f13425b4f188ccd191019649ba9..c1537faeb64f5d4cb667a02449728b20226e9f7f 100755
+--- a/configure
++++ b/configure
+@@ -22944,6 +22944,7 @@ wine_fn_config_makefile dlls/wineps16.drv16 enable_win16
+ wine_fn_config_makefile dlls/winepulse.drv enable_winepulse_drv
+ wine_fn_config_makefile dlls/wineusb.sys enable_wineusb_sys
+ wine_fn_config_makefile dlls/winevulkan enable_winevulkan
++wine_fn_config_makefile dlls/wineterm.drv enable_wineterm_drv
+ wine_fn_config_makefile dlls/winewayland.drv enable_winewayland_drv
+ wine_fn_config_makefile dlls/winex11.drv enable_winex11_drv
+ wine_fn_config_makefile dlls/winexinput.sys enable_winexinput_sys
+diff --git a/configure.ac b/configure.ac
+index 033274041f63a51bb1b18f15009659ff3696061b..54ee2ecd9e90c12bf4947108347b451e4d25081c 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -3406,6 +3406,7 @@ WINE_CONFIG_MAKEFILE(dlls/wineps16.drv16)
+ WINE_CONFIG_MAKEFILE(dlls/winepulse.drv)
+ WINE_CONFIG_MAKEFILE(dlls/wineusb.sys)
+ WINE_CONFIG_MAKEFILE(dlls/winevulkan)
++WINE_CONFIG_MAKEFILE(dlls/wineterm.drv)
+ WINE_CONFIG_MAKEFILE(dlls/winewayland.drv)
+ WINE_CONFIG_MAKEFILE(dlls/winex11.drv)
+ WINE_CONFIG_MAKEFILE(dlls/winexinput.sys)
+diff --git a/dlls/ntdll/loader.c b/dlls/ntdll/loader.c
+index b0b2392c504765cd89289af576c91e7bd609d790..6b7b84eb79d25a860bcf6a309c7752d4bfe51194 100644
+--- a/dlls/ntdll/loader.c
++++ b/dlls/ntdll/loader.c
+@@ -2259,6 +2259,66 @@ done:
+ }
+ 
+ 
++/* Opt-in Steam bridge for the terminal build. As in Valve Proton's loader,
++ * preserve the installed Windows steamclient image and redirect its exported
++ * entry points to lsteamclient, which calls the running Linux Steam client.
++ * The native client implementation and its DllMain must never run. */
++static NTSTATUS winetk_steam_bridge( WINE_MODREF *wm, LPCWSTR load_path )
++{
++    UNICODE_STRING name = RTL_CONSTANT_STRING( L"WINETK_STEAM_BRIDGE" );
++    WCHAR buffer[4];
++    UNICODE_STRING value = {0, sizeof(buffer), buffer};
++    UNICODE_STRING bridge = RTL_CONSTANT_STRING( L"lsteamclient.dll" );
++    HMODULE target;
++    const IMAGE_EXPORT_DIRECTORY *exports;
++    const IMAGE_NT_HEADERS *nt = RtlImageNtHeader( wm->ldr.DllBase );
++    const DWORD *names;
++    ULONG size, i, patched = 0;
++
++    if (wcsicmp( wm->ldr.BaseDllName.Buffer, L"steamclient.dll" ) &&
++        wcsicmp( wm->ldr.BaseDllName.Buffer, L"steamclient64.dll" )) return STATUS_NOT_SUPPORTED;
++    if (RtlQueryEnvironmentVariable_U( NULL, &name, &value ) || !value.Length || buffer[0] != '1')
++        return STATUS_NOT_SUPPORTED;
++    if (LdrLoadDll( load_path, 0, &bridge, &target )) return STATUS_DLL_NOT_FOUND;
++    exports = RtlImageDirectoryEntryToData( wm->ldr.DllBase, TRUE, IMAGE_DIRECTORY_ENTRY_EXPORT, &size );
++    if (!exports) return STATUS_INVALID_IMAGE_FORMAT;
++    names = get_rva( wm->ldr.DllBase, exports->AddressOfNames );
++    for (i = 0; i < exports->NumberOfNames; ++i)
++    {
++        const char *symbol = get_rva( wm->ldr.DllBase, names[i] );
++        BYTE *source = RtlFindExportedRoutineByName( wm->ldr.DllBase, symbol );
++        void *dest = RtlFindExportedRoutineByName( target, symbol );
++        BOOL x64 = nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC;
++        SIZE_T length = x64 ? 12 : 7;
++        void *address = source;
++        DWORD old, ignored;
++        if (!source || !dest) continue;
++        if (NtProtectVirtualMemory( NtCurrentProcess(), &address, &length, PAGE_EXECUTE_READWRITE, &old ))
++            return STATUS_ACCESS_DENIED;
++        /* mov rax/eax, destination; jmp rax/eax */
++        if (x64)
++        {
++            ULONGLONG pointer = (ULONG_PTR)dest;
++            source[0] = 0x48; source[1] = 0xb8;
++            memcpy( source + 2, &pointer, sizeof(pointer) );
++            source[10] = 0xff; source[11] = 0xe0;
++        }
++        else
++        {
++            ULONG pointer = (ULONG_PTR)dest;
++            source[0] = 0xb8;
++            memcpy( source + 1, &pointer, sizeof(pointer) );
++            source[5] = 0xff; source[6] = 0xe0;
++        }
++        NtProtectVirtualMemory( NtCurrentProcess(), &address, &length, old, &ignored );
++        ++patched;
++    }
++    NtFlushInstructionCache( NtCurrentProcess(), wm->ldr.DllBase, nt->OptionalHeader.SizeOfImage );
++    TRACE( "WineTK Steam bridge %s: %lu exports redirected\n", debugstr_w(wm->ldr.BaseDllName.Buffer), patched );
++    return patched ? STATUS_SUCCESS : STATUS_PROCEDURE_NOT_FOUND;
++}
++
++
+ /*************************************************************************
+  *		build_module
+  *
+@@ -2296,6 +2356,13 @@ static NTSTATUS build_module( LPCWSTR load_path, const UNICODE_STRING *nt_name,
+ 
+     update_load_config( *module );
+ 
++    if (!is_builtin)
++    {
++        status = winetk_steam_bridge( wm, load_path );
++        if (!status) flags |= LDR_DONT_RESOLVE_REFS;
++        else if (status != STATUS_NOT_SUPPORTED) goto failed_imports;
++    }
++
+     /* fixup imports */
+ 
+     if (!(flags & LDR_DONT_RESOLVE_REFS) &&
+@@ -2308,6 +2375,7 @@ static NTSTATUS build_module( LPCWSTR load_path, const UNICODE_STRING *nt_name,
+             status = fixup_imports( wm, load_path );
+         if (status != STATUS_SUCCESS)
+         {
++failed_imports:
+             /* the module has only be inserted in the load & memory order lists */
+             RemoveEntryList(&wm->ldr.InLoadOrderLinks);
+             RemoveEntryList(&wm->ldr.InMemoryOrderLinks);
+diff --git a/dlls/win32u/dce.c b/dlls/win32u/dce.c
+index 67d3dc84bc7ce6fd641596e4d087ec8ceb5f5955..3a4e34814f49d853e94d1bb7f8ecbb72c29b3560 100644
+--- a/dlls/win32u/dce.c
++++ b/dlls/win32u/dce.c
+@@ -756,14 +756,23 @@ void register_window_surface( struct window_surface *old, struct window_surface
+ void flush_window_surfaces( BOOL idle )
+ {
+     static DWORD last_idle;
++    static UINT busy_interval;
+     DWORD now;
+     struct window_surface *surface;
+ 
+     pthread_mutex_lock( &surfaces_lock );
+     now = NtGetTickCount();
++    if (!busy_interval)
++    {
++        const char *value = getenv("WINETK_FPS");
++        char *end;
++        unsigned long fps = value ? strtoul(value, &end, 10) : 0;
++        busy_interval = value && value[0] && !*end && fps >= 1 && fps <= 240 ?
++                        max(1, 1000 / fps) : 50;
++    }
+     if (idle) last_idle = now;
+     /* if not idle, we only flush if there's evidence that the app never goes idle */
+-    else if ((int)(now - last_idle) < 50) goto done;
++    else if ((int)(now - last_idle) < (int)busy_interval) goto done;
+ 
+     LIST_FOR_EACH_ENTRY( surface, &window_surfaces, struct window_surface, entry )
+         window_surface_flush( surface );
+diff --git a/dlls/win32u/window.c b/dlls/win32u/window.c
+index e2bde691d21d516ff90a5031604aba9778b3f807..8349c898fc39e4aedddb797afaa685234b3adedf 100644
+--- a/dlls/win32u/window.c
++++ b/dlls/win32u/window.c
+@@ -2167,8 +2167,13 @@ static BOOL get_surface_rect( const RECT *visible_rect, RECT *surface_rect )
+ 
+     *surface_rect = *visible_rect;
+ 
+-    /* crop surfaces which are larger than the virtual screen rect, some applications create huge windows */
+-    if ((surface_rect->right - surface_rect->left > virtual_rect.right - virtual_rect.left ||
++    /* WineTK follows the application's client dimensions, so a normal window
++     * may grow beyond its virtual display mode. Retain bounded surfaces up to
++     * the terminal driver's padded storage limit; still crop huge windows. */
++    if (!(getenv("WINETK_SOCKET") &&
++          surface_rect->right - surface_rect->left <= 2048 &&
++          surface_rect->bottom - surface_rect->top <= 1152) &&
++        (surface_rect->right - surface_rect->left > virtual_rect.right - virtual_rect.left ||
+          surface_rect->bottom - surface_rect->top > virtual_rect.bottom - virtual_rect.top) &&
+         !intersect_rect( surface_rect, surface_rect, &virtual_rect ))
+         return FALSE;
+@@ -4605,6 +4610,14 @@ MINMAXINFO get_min_max_info( HWND hwnd )
+     }
+     minmax.ptMaxTrackSize.x = get_system_metrics( SM_CXMAXTRACK );
+     minmax.ptMaxTrackSize.y = get_system_metrics( SM_CYMAXTRACK );
++    /* A WineTK canvas follows normal top-level client sizes independently of
++     * the initial virtual display mode. Let the app request a larger bounded
++     * window; its WM_GETMINMAXINFO handler can still override these defaults. */
++    if (!(style & WS_CHILD) && getenv("WINETK_SOCKET"))
++    {
++        minmax.ptMaxTrackSize.x = max(minmax.ptMaxTrackSize.x, 2048);
++        minmax.ptMaxTrackSize.y = max(minmax.ptMaxTrackSize.y, 1152);
++    }
+     minmax.ptMaxPosition.x = -xinc;
+     minmax.ptMaxPosition.y = -yinc;
+ 
+diff --git a/dlls/wineterm.drv/Makefile.in b/dlls/wineterm.drv/Makefile.in
+new file mode 100644
+index 0000000000000000000000000000000000000000..f9570603ad72448260b1d17b617cd40188999beb
+--- /dev/null
++++ b/dlls/wineterm.drv/Makefile.in
+@@ -0,0 +1,11 @@
++MODULE = wineterm.drv
++UNIXLIB = wineterm.so
++UNIX_LIBS = -lwin32u $(PTHREAD_LIBS)
++IMPORTS = user32 win32u
++
++VER_FILEDESCRIPTION_STR = "Wine terminal graphics driver"
++
++SOURCES = \
++	dllmain.c \
++	opengl.c \
++	term.c
+diff --git a/dlls/wineterm.drv/dllmain.c b/dlls/wineterm.drv/dllmain.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..2314945a568d31984402c4af4c8f0c8125355719
+--- /dev/null
++++ b/dlls/wineterm.drv/dllmain.c
+@@ -0,0 +1,21 @@
++/* Terminal graphics driver. Copyright 2026 WineTK contributors.
++ * SPDX-License-Identifier: LGPL-2.1-or-later */
++#include "unixlib.h"
++
++static DWORD WINAPI read_events_thread(void *unused)
++{
++    WINE_UNIX_CALL(term_read_events, NULL);
++    return 0;
++}
++
++BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void *reserved)
++{
++    HANDLE thread;
++    if (reason != DLL_PROCESS_ATTACH) return TRUE;
++    DisableThreadLibraryCalls(instance);
++    if (__wine_init_unix_call() || WINE_UNIX_CALL(term_init, NULL)) return FALSE;
++    /* Running the Unix reader on a Windows thread gives NtUserSendHardwareInput
++     * a valid TEB and lets wineserver wake the actual application GUI thread. */
++    if ((thread = CreateThread(NULL, 0, read_events_thread, NULL, 0, NULL))) CloseHandle(thread);
++    return TRUE;
++}
+diff --git a/dlls/wineterm.drv/opengl.c b/dlls/wineterm.drv/opengl.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..6268661357d0848c5304c70d2bb5b2309bd4961b
+--- /dev/null
++++ b/dlls/wineterm.drv/opengl.c
+@@ -0,0 +1,341 @@
++/* Surfaceless EGL presentation to the WineTK terminal broker.
++ * Copyright 2026 WineTK contributors.
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ */
++#if 0
++#pragma makedep unix
++#endif
++#include "config.h"
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++#include "ntstatus.h"
++#include "wine/gdi_driver.h"
++#include "wine/opengl_driver.h"
++#include "wine/winetk_protocol.h"
++#include "termdrv.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(termdrv);
++
++#ifdef SONAME_LIBEGL
++
++static const struct opengl_funcs *funcs;
++static const struct egl_platform *egl;
++static struct opengl_driver_funcs term_driver;
++static const struct opengl_drawable_funcs term_drawable_funcs;
++static BOOL (*egl_context_activate)(struct opengl_context *, struct opengl_drawable *, struct opengl_drawable *);
++static pthread_mutex_t native_buffer_mutex = PTHREAD_MUTEX_INITIALIZER;
++static GLenum native_color_buffer;
++static BOOL metrics_enabled;
++
++struct term_gl_drawable
++{
++    struct opengl_drawable base;
++    SIZE size;
++    unsigned char *pixels;
++    unsigned char *row;
++    HWND registered_hwnd;
++    GLenum native_buffer;
++    pthread_mutex_t mutex;
++    BOOL mutex_initialized;
++    uint64_t metric_start, metric_frames, metric_times[4];
++};
++
++static uint64_t term_clock_ns(void)
++{
++    struct timespec now;
++    clock_gettime(CLOCK_MONOTONIC, &now);
++    return (uint64_t)now.tv_sec * 1000000000 + now.tv_nsec;
++}
++
++static struct term_gl_drawable *term_gl(struct opengl_drawable *base)
++{
++    return CONTAINING_RECORD(base, struct term_gl_drawable, base);
++}
++
++static void term_set_native_buffer(struct opengl_drawable *base, GLenum buffer)
++{
++    GLenum left = buffer == GL_BACK ? GL_BACK_LEFT : GL_FRONT_LEFT;
++    term_gl(base)->native_buffer = buffer;
++    opengl_drawable_map_buffer(base, GL_FRONT_LEFT, left);
++    opengl_drawable_map_buffer(base, GL_FRONT, buffer);
++    opengl_drawable_map_buffer(base, GL_LEFT, left);
++    opengl_drawable_map_buffer(base, GL_FRONT_AND_BACK, buffer);
++    opengl_drawable_map_buffer(base, GL_BACK_LEFT, left);
++    opengl_drawable_map_buffer(base, GL_BACK, buffer);
++}
++
++static GLenum term_probe_native_buffer(struct opengl_drawable *base)
++{
++    const EGLint attrs[] = {EGL_NONE};
++    EGLContext previous = funcs->p_eglGetCurrentContext(), probe;
++    EGLSurface draw = funcs->p_eglGetCurrentSurface(EGL_DRAW);
++    EGLSurface read = funcs->p_eglGetCurrentSurface(EGL_READ);
++    GLint buffer = GL_FRONT;
++    /* Do not infer the native convention from application state: a context may
++     * already have GL_NONE selected on its default framebuffer. A fresh temporary
++     * context observes the pbuffer defaults without touching application GL state. */
++    if (!(probe = funcs->p_eglCreateContext(egl->display, EGL_NO_CONFIG_KHR, NULL, attrs))) return 0;
++    if (!funcs->p_eglMakeCurrent(egl->display, base->surface, base->surface, probe))
++    {
++        funcs->p_eglDestroyContext(egl->display, probe);
++        return 0;
++    }
++    funcs->p_glGetIntegerv(GL_DRAW_BUFFER, &buffer);
++    if (!funcs->p_eglMakeCurrent(egl->display, draw, read, previous))
++    {
++        funcs->p_eglMakeCurrent(egl->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++        funcs->p_eglDestroyContext(egl->display, probe);
++        return 0;
++    }
++    funcs->p_eglDestroyContext(egl->display, probe);
++    return buffer == GL_BACK || buffer == GL_BACK_LEFT ? GL_BACK : GL_FRONT;
++}
++
++static BOOL term_map_native_buffer(struct opengl_drawable *base)
++{
++    struct term_gl_drawable *gl;
++    BOOL result = TRUE;
++    if (!base || base->funcs != &term_drawable_funcs) return TRUE;
++    gl = term_gl(base);
++    pthread_mutex_lock(&gl->mutex);
++    if (gl->native_buffer) goto done;
++    /* Mesa and NVIDIA expose different default buffer conventions for EGL
++     * pbuffers. Cache the platform convention instead of assuming GL_FRONT. */
++    pthread_mutex_lock(&native_buffer_mutex);
++    if (!native_color_buffer)
++    {
++        native_color_buffer = term_probe_native_buffer(base);
++    }
++    if (!native_color_buffer) result = FALSE;
++    else term_set_native_buffer(base, native_color_buffer);
++    pthread_mutex_unlock(&native_buffer_mutex);
++    TRACE("pbuffer %p host color buffer %#x\n", base, gl->native_buffer);
++done:
++    pthread_mutex_unlock(&gl->mutex);
++    return result;
++}
++
++static BOOL term_context_activate(struct opengl_context *context, struct opengl_drawable *draw,
++                                  struct opengl_drawable *read)
++{
++    if (!egl_context_activate(context, draw, read)) return FALSE;
++    if (!term_map_native_buffer(draw)) return FALSE;
++    if (read != draw && !term_map_native_buffer(read)) return FALSE;
++    return TRUE;
++}
++
++static void term_init_egl_platform(struct egl_platform *platform)
++{
++    /* Never resolve a native display or open a compositor connection. */
++    platform->type = EGL_PLATFORM_SURFACELESS_MESA;
++    platform->native_display = 0;
++    platform->force_pbuffer_formats = TRUE;
++    egl = platform;
++}
++
++static BOOL term_resize_drawable(struct term_gl_drawable *gl)
++{
++    SIZE size = gl->base.client->raw ? gl->base.monitor_size : gl->base.virtual_size;
++    EGLint attrs[] = {EGL_WIDTH, size.cx, EGL_HEIGHT, size.cy, EGL_NONE};
++    EGLSurface surface, old = gl->base.surface;
++    EGLSurface draw, read;
++    EGLContext context;
++    unsigned char *pixels, *row;
++    EGLConfig config;
++
++    if (size.cx <= 0 || size.cy <= 0 || size.cx > WT_WINE_MAX_WIDTH || size.cy > WT_WINE_MAX_HEIGHT)
++        return FALSE;
++    if (gl->size.cx == size.cx && gl->size.cy == size.cy) return TRUE;
++    if (!(pixels = malloc((size_t)size.cx * size.cy * 4))) return FALSE;
++    if (!(row = malloc((size_t)size.cx * 4))) { free(pixels); return FALSE; }
++    config = egl->configs[(gl->base.format - 1) % egl->config_count];
++    if (!(surface = funcs->p_eglCreatePbufferSurface(egl->display, config, attrs)))
++    {
++        WARN("failed to allocate %dx%d EGL pbuffer, error %#x\n", (int)size.cx, (int)size.cy,
++             funcs->p_eglGetError());
++        free(pixels);
++        free(row);
++        return FALSE;
++    }
++    draw = funcs->p_eglGetCurrentSurface(EGL_DRAW);
++    read = funcs->p_eglGetCurrentSurface(EGL_READ);
++    context = funcs->p_eglGetCurrentContext();
++    if (old && context && (draw == old || read == old) &&
++        !funcs->p_eglMakeCurrent(egl->display, draw == old ? surface : draw,
++                                read == old ? surface : read, context))
++    {
++        funcs->p_eglDestroySurface(egl->display, surface);
++        free(pixels);
++        free(row);
++        return FALSE;
++    }
++    gl->base.surface = surface;
++    gl->size = size;
++    free(gl->pixels);
++    free(gl->row);
++    gl->pixels = pixels;
++    gl->row = row;
++    if (old) funcs->p_eglDestroySurface(egl->display, old);
++    TRACE("created pbuffer hwnd %p %dx%d\n", gl->base.client->hwnd, (int)size.cx, (int)size.cy);
++    return TRUE;
++}
++
++static void term_drawable_destroy(struct opengl_drawable *base)
++{
++    struct term_gl_drawable *gl = term_gl(base);
++    if (gl->registered_hwnd) term_set_gpu_active(gl->registered_hwnd, FALSE);
++    free(gl->pixels);
++    free(gl->row);
++    if (gl->mutex_initialized) pthread_mutex_destroy(&gl->mutex);
++    /* win32u releases the EGL surface and client reference. */
++}
++
++static BOOL term_readback(struct opengl_drawable *base)
++{
++    static const GLenum pack_names[] = {GL_PACK_ALIGNMENT, GL_PACK_ROW_LENGTH, GL_PACK_SKIP_PIXELS,
++                                       GL_PACK_SKIP_ROWS, GL_PACK_SWAP_BYTES, GL_PACK_LSB_FIRST};
++    static const GLint pack_defaults[] = {4, 0, 0, 0, 0, 0};
++    struct term_gl_drawable *gl = term_gl(base);
++    GLint framebuffer, buffer, pbo, pack[ARRAY_SIZE(pack_names)];
++    unsigned int i, y;
++    size_t stride = (size_t)gl->size.cx * 4;
++    uint64_t marks[5] = {0};
++    BOOL result;
++
++    if (!base->client->hwnd || !gl->pixels) return FALSE;
++    if (metrics_enabled) marks[0] = term_clock_ns();
++    /* Read the pbuffer, regardless of an application's current offscreen FBO or
++     * pack PBO. Restore all touched state before returning to application GL. */
++    funcs->p_glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &framebuffer);
++    funcs->p_glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pbo);
++    funcs->p_glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
++    funcs->p_glGetIntegerv(GL_READ_BUFFER, &buffer);
++    funcs->p_glReadBuffer(gl->native_buffer);
++    funcs->p_glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
++    for (i = 0; i < ARRAY_SIZE(pack_names); ++i)
++    {
++        funcs->p_glGetIntegerv(pack_names[i], &pack[i]);
++        funcs->p_glPixelStorei(pack_names[i], pack_defaults[i]);
++    }
++    if (metrics_enabled) marks[1] = term_clock_ns();
++    funcs->p_glReadPixels(0, 0, gl->size.cx, gl->size.cy, GL_RGBA, GL_UNSIGNED_BYTE, gl->pixels);
++    if (metrics_enabled) marks[2] = term_clock_ns();
++    for (i = 0; i < ARRAY_SIZE(pack_names); ++i) funcs->p_glPixelStorei(pack_names[i], pack[i]);
++    funcs->p_glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo);
++    funcs->p_glReadBuffer(buffer);
++    funcs->p_glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
++
++    /* OpenGL's origin is bottom-left; the terminal protocol is top-down. */
++    for (y = 0; y < gl->size.cy / 2; ++y)
++    {
++        unsigned char *top = gl->pixels + (size_t)y * stride;
++        unsigned char *bottom = gl->pixels + (size_t)(gl->size.cy - 1 - y) * stride;
++        memcpy(gl->row, top, stride);
++        memcpy(top, bottom, stride);
++        memcpy(bottom, gl->row, stride);
++    }
++    for (i = 0; i < (size_t)gl->size.cx * gl->size.cy; ++i) gl->pixels[i * 4 + 3] = 255;
++    if (metrics_enabled) marks[3] = term_clock_ns();
++    result = term_publish_frame(base->client->hwnd, gl->pixels, gl->size.cx, gl->size.cy);
++    if (metrics_enabled)
++    {
++        marks[4] = term_clock_ns();
++        if (!gl->metric_start) gl->metric_start = marks[0];
++        ++gl->metric_frames;
++        for (i = 0; i < 4; ++i) gl->metric_times[i] += marks[i + 1] - marks[i];
++        if (marks[4] - gl->metric_start >= 1000000000)
++        {
++            double scale = gl->metric_frames * 1000000.0;
++            fprintf(stderr, "WINETK_GL_METRICS hwnd=%p frames=%llu fps=%.2f setup_ms=%.3f read_ms=%.3f copy_ms=%.3f send_ms=%.3f\n",
++                    base->client->hwnd, (unsigned long long)gl->metric_frames,
++                    gl->metric_frames * 1000000000.0 / (marks[4] - gl->metric_start),
++                    gl->metric_times[0] / scale, gl->metric_times[1] / scale,
++                    gl->metric_times[2] / scale, gl->metric_times[3] / scale);
++            gl->metric_frames = 0;
++            memset(gl->metric_times, 0, sizeof(gl->metric_times));
++            gl->metric_start = marks[4];
++        }
++    }
++    return result;
++}
++
++static void term_drawable_flush(struct opengl_drawable *base, UINT flags)
++{
++    struct term_gl_drawable *gl = term_gl(base);
++    pthread_mutex_lock(&gl->mutex);
++    if (flags & GL_FLUSH_UPDATED) term_resize_drawable(term_gl(base));
++    /* The terminal owns pacing; an EGL pbuffer has no display refresh. */
++    if (flags & GL_FLUSH_PRESENT) term_readback(base);
++    pthread_mutex_unlock(&gl->mutex);
++}
++
++static BOOL term_drawable_swap(struct opengl_drawable *base)
++{
++    struct term_gl_drawable *gl = term_gl(base);
++    BOOL result;
++    client_surface_present(base->client);
++    pthread_mutex_lock(&gl->mutex);
++    result = term_readback(base);
++    pthread_mutex_unlock(&gl->mutex);
++    return result;
++}
++
++static const struct opengl_drawable_funcs term_drawable_funcs =
++{
++    .size = sizeof(struct term_gl_drawable),
++    .destroy = term_drawable_destroy,
++    .flush = term_drawable_flush,
++    .swap = term_drawable_swap,
++};
++
++static BOOL term_surface_create(struct client_surface *client, int format, struct opengl_drawable **drawable)
++{
++    struct term_gl_drawable *gl;
++    if (!(gl = opengl_drawable_create(&term_drawable_funcs, format, client, NULL))) return FALSE;
++    if (pthread_mutex_init(&gl->mutex, NULL)) { opengl_drawable_release(&gl->base); return FALSE; }
++    gl->mutex_initialized = TRUE;
++    /* EGL pbuffers have one color buffer. WGL's emulated front/back aliases both
++     * address it; presentation reads it before the next application frame. */
++    opengl_drawable_map_buffer(&gl->base, GL_FRONT_LEFT, GL_FRONT);
++    opengl_drawable_map_buffer(&gl->base, GL_FRONT, GL_FRONT);
++    opengl_drawable_map_buffer(&gl->base, GL_LEFT, GL_FRONT);
++    opengl_drawable_map_buffer(&gl->base, GL_FRONT_AND_BACK, GL_FRONT);
++    opengl_drawable_map_buffer(&gl->base, GL_BACK_LEFT, GL_FRONT);
++    opengl_drawable_map_buffer(&gl->base, GL_BACK, GL_FRONT);
++    if (!term_resize_drawable(gl)) { opengl_drawable_release(&gl->base); return FALSE; }
++    gl->registered_hwnd = client->hwnd;
++    term_set_gpu_active(gl->registered_hwnd, TRUE);
++    *drawable = &gl->base;
++    return TRUE;
++}
++
++UINT TERM_OpenGLInit(UINT version, const struct opengl_funcs *opengl_funcs,
++                    const struct opengl_driver_funcs **driver_funcs)
++{
++    if (version != WINE_OPENGL_DRIVER_VERSION) return STATUS_INVALID_PARAMETER;
++    if (!opengl_funcs->egl_handle) return STATUS_NOT_SUPPORTED;
++    funcs = opengl_funcs;
++    metrics_enabled = getenv("WINETK_GL_METRICS") && !strcmp(getenv("WINETK_GL_METRICS"), "1");
++    /* Reuse Wine's EGL contexts, formats, extensions and pbuffers. Only an
++     * onscreen drawable's storage and presentation are terminal specific. */
++    term_driver = **driver_funcs;
++    egl_context_activate = term_driver.p_context_activate;
++    term_driver.p_init_egl_platform = term_init_egl_platform;
++    term_driver.p_surface_create = term_surface_create;
++    term_driver.p_context_activate = term_context_activate;
++    *driver_funcs = &term_driver;
++    return STATUS_SUCCESS;
++}
++
++#else
++
++UINT TERM_OpenGLInit(UINT version, const struct opengl_funcs *opengl_funcs,
++                    const struct opengl_driver_funcs **driver_funcs)
++{
++    return STATUS_NOT_SUPPORTED;
++}
++
++#endif
+diff --git a/dlls/wineterm.drv/term.c b/dlls/wineterm.drv/term.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..be8a2c309f88c36b64d083f350f1bc996b5d1d6e
+--- /dev/null
++++ b/dlls/wineterm.drv/term.c
+@@ -0,0 +1,592 @@
++/* Terminal graphics driver. Copyright 2026 WineTK contributors.
++ * SPDX-License-Identifier: LGPL-2.1-or-later */
++#if 0
++#pragma makedep unix
++#endif
++#include "config.h"
++#include <errno.h>
++#include <poll.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <time.h>
++#include <unistd.h>
++#include "ntstatus.h"
++#include "wine/gdi_driver.h"
++#include "wine/server.h"
++#include "ntgdi.h"
++#include "wine/winetk_protocol.h"
++#include "unixlib.h"
++#include "termdrv.h"
++
++WINE_DEFAULT_DEBUG_CHANNEL(termdrv);
++
++C_ASSERT(sizeof(struct wt_wine_header) == 16);
++C_ASSERT(sizeof(struct wt_wine_window) == 48);
++C_ASSERT(sizeof(struct wt_wine_destroy) == 16);
++C_ASSERT(sizeof(struct wt_wine_input) == 32);
++
++#define DEFAULT_DESKTOP_WIDTH 800
++#define DEFAULT_DESKTOP_HEIGHT 600
++#define SEND_TIMEOUT_MS 250
++
++static int connection = -1;
++static BOOL broken;
++static UINT desktop_width = DEFAULT_DESKTOP_WIDTH, desktop_height = DEFAULT_DESKTOP_HEIGHT;
++static UINT desktop_depth = 32, desktop_frequency = 60;
++static pthread_mutex_t send_mutex = PTHREAD_MUTEX_INITIALIZER;
++static pthread_mutex_t geometry_mutex = PTHREAD_MUTEX_INITIALIZER;
++/* A window may have several OpenGL drawables during context replacement.
++ * Bound bookkeeping rather than growing on every untrusted HWND creation. */
++static struct { HWND hwnd; UINT refs; } gpu_windows[128];
++
++void term_set_gpu_active(HWND hwnd, BOOL active)
++{
++    UINT i, empty = ARRAYSIZE(gpu_windows);
++    pthread_mutex_lock(&geometry_mutex);
++    for (i = 0; i < ARRAYSIZE(gpu_windows); ++i)
++    {
++        if (!gpu_windows[i].refs && empty == ARRAYSIZE(gpu_windows)) empty = i;
++        if (gpu_windows[i].hwnd != hwnd || !gpu_windows[i].refs) continue;
++        if (active) gpu_windows[i].refs++;
++        else if (!--gpu_windows[i].refs) gpu_windows[i].hwnd = NULL;
++        break;
++    }
++    if (active && i == ARRAYSIZE(gpu_windows))
++    {
++        if (empty < ARRAYSIZE(gpu_windows))
++        {
++            gpu_windows[empty].hwnd = hwnd;
++            gpu_windows[empty].refs = 1;
++        }
++        else WARN("too many OpenGL client windows to suppress GDI output\n");
++    }
++    pthread_mutex_unlock(&geometry_mutex);
++}
++
++/* Called only while holding geometry_mutex. */
++static BOOL has_gpu_client(HWND hwnd)
++{
++    UINT i;
++    for (i = 0; i < ARRAYSIZE(gpu_windows); ++i)
++        if (gpu_windows[i].hwnd == hwnd && gpu_windows[i].refs) return TRUE;
++    return FALSE;
++}
++
++struct term_surface
++{
++    struct window_surface header;
++    RECT visible, client;
++    BOOL visible_flag;
++    unsigned char *rgba;
++    size_t rgba_capacity;
++};
++
++static uint64_t monotonic_ms(void)
++{
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
++}
++
++/* Nonblocking sends and one deadline for an entire frame avoid an indefinitely
++ * blocked Wine GUI thread when a terminal/broker stops consuming output. */
++static BOOL send_bytes(const void *buffer, size_t length, uint64_t deadline)
++{
++    const char *bytes = buffer;
++    while (length)
++    {
++        ssize_t sent = send(connection, bytes, length, MSG_NOSIGNAL | MSG_DONTWAIT);
++        if (sent > 0) { bytes += sent; length -= sent; continue; }
++        if (sent < 0 && errno == EINTR) continue;
++        if (sent < 0 && (errno == EAGAIN))
++        {
++            struct pollfd fd = {connection, POLLOUT, 0};
++            uint64_t now = monotonic_ms();
++            int remaining, ready;
++            if (now >= deadline) return FALSE;
++            remaining = deadline - now;
++            ready = poll(&fd, 1, remaining);
++            if (ready < 0 && errno == EINTR) continue;
++            if (ready > 0 && (fd.revents & POLLOUT)) continue;
++        }
++        return FALSE;
++    }
++    return TRUE;
++}
++
++static BOOL send_message(UINT type, const void *payload, UINT size, const void *pixels, UINT pixel_size)
++{
++    struct wt_wine_header header = {WT_WINE_MAGIC, WT_WINE_VERSION, type, size + pixel_size};
++    BOOL ok = FALSE;
++    uint64_t deadline;
++    pthread_mutex_lock(&send_mutex);
++    deadline = monotonic_ms() + SEND_TIMEOUT_MS;
++    if (!broken && connection != -1)
++    {
++        ok = send_bytes(&header, sizeof(header), deadline) &&
++             send_bytes(payload, size, deadline) &&
++             (!pixel_size || send_bytes(pixels, pixel_size, deadline));
++        if (!ok)
++        {
++            WARN("terminal connection failed or exceeded %u ms; stopping transfer\n", SEND_TIMEOUT_MS);
++            broken = TRUE;
++            /* Keep the fd number stable for the concurrent reader. No reconnect
++             * on a partially transmitted frame: that would corrupt framing. */
++            shutdown(connection, SHUT_RDWR);
++        }
++    }
++    pthread_mutex_unlock(&send_mutex);
++    return ok;
++}
++
++static BOOL read_bytes(void *buffer, size_t size)
++{
++    char *bytes = buffer;
++    while (size)
++    {
++        ssize_t got = recv(connection, bytes, size, 0);
++        if (got > 0) { bytes += got; size -= got; continue; }
++        if (got < 0 && errno == EINTR) continue;
++        return FALSE;
++    }
++    return TRUE;
++}
++
++/* A terminal canvas has no fixed host monitor mode. Report common legacy game
++ * modes and retain the mode selected by ChangeDisplaySettings in this process. */
++static UINT term_update_display_devices(const struct gdi_device_manager *manager, void *param)
++{
++    static const UINT dimensions[][2] = {{320,240}, {640,480}, {800,600}, {1024,768},
++                                        {1280,720}, {1280,960}, {1600,900}, {1920,1080}};
++    struct pci_id pci = {0};
++    struct gdi_monitor monitor = {0};
++    DEVMODEW modes[ARRAYSIZE(dimensions) * 2 + 1], current = {.dmSize = sizeof(current)};
++    UINT count = 0, i, depth;
++    pthread_mutex_lock(&geometry_mutex);
++    current.dmFields = DM_POSITION | DM_DISPLAYORIENTATION | DM_BITSPERPEL | DM_PELSWIDTH |
++                       DM_PELSHEIGHT | DM_DISPLAYFLAGS | DM_DISPLAYFREQUENCY;
++    current.dmBitsPerPel = desktop_depth;
++    current.dmPelsWidth = desktop_width;
++    current.dmPelsHeight = desktop_height;
++    current.dmDisplayFrequency = desktop_frequency;
++    pthread_mutex_unlock(&geometry_mutex);
++    manager->add_gpu("WineTK terminal display", &pci, NULL, param);
++    manager->add_source("WineTK terminal", DISPLAY_DEVICE_ATTACHED_TO_DESKTOP | DISPLAY_DEVICE_PRIMARY_DEVICE, 96, param);
++    SetRect(&monitor.rc_monitor, 0, 0, current.dmPelsWidth, current.dmPelsHeight);
++    monitor.rc_work = monitor.rc_monitor;
++    manager->add_monitor(&monitor, param);
++    modes[count++] = current;
++    for (depth = 16; depth <= 32; depth += 16)
++        for (i = 0; i < ARRAYSIZE(dimensions); ++i)
++        {
++            DEVMODEW *mode;
++            if (depth == current.dmBitsPerPel && dimensions[i][0] == current.dmPelsWidth &&
++                dimensions[i][1] == current.dmPelsHeight) continue;
++            mode = &modes[count++];
++            *mode = current;
++            mode->dmPelsWidth = dimensions[i][0];
++            mode->dmPelsHeight = dimensions[i][1];
++            mode->dmBitsPerPel = depth;
++        }
++    manager->add_modes(&current, count, modes, param);
++    return STATUS_SUCCESS;
++}
++
++static LONG term_change_display_settings(DEVMODEW *displays, const WCHAR *primary_name,
++                                         HWND hwnd, DWORD flags, void *param)
++{
++    DEVMODEW *mode = displays;
++    if (!mode || !mode->dmSize || !mode->dmPelsWidth || !mode->dmPelsHeight ||
++        mode->dmPelsWidth > WT_WINE_MAX_WIDTH || mode->dmPelsHeight > WT_WINE_MAX_HEIGHT ||
++        (mode->dmBitsPerPel != 16 && mode->dmBitsPerPel != 32)) return DISP_CHANGE_BADMODE;
++    /* There is exactly one virtual display. Wine validates requested modes and
++     * updates its shared display registry/cache after this callback succeeds. */
++    if (((DEVMODEW *)((char *)mode + mode->dmSize + mode->dmDriverExtra))->dmSize)
++        return DISP_CHANGE_BADPARAM;
++    pthread_mutex_lock(&geometry_mutex);
++    desktop_width = mode->dmPelsWidth;
++    desktop_height = mode->dmPelsHeight;
++    desktop_depth = mode->dmBitsPerPel;
++    desktop_frequency = mode->dmDisplayFrequency ? mode->dmDisplayFrequency : 60;
++    pthread_mutex_unlock(&geometry_mutex);
++    TRACE("display mode %ux%u %u bpp %u Hz\n", desktop_width, desktop_height,
++          desktop_depth, desktop_frequency);
++    return DISP_CHANGE_SUCCESSFUL;
++}
++
++static void describe_client(struct wt_wine_window *window, const RECT *client)
++{
++    window->client_x = client->left;
++    window->client_y = client->top;
++    window->client_width = max(0, client->right - client->left);
++    window->client_height = max(0, client->bottom - client->top);
++}
++
++/* Called by the surfaceless EGL swap path. Pixel storage is top-down RGBA8;
++ * query the client origin so that no titlebar offsets reach the GPU canvas. */
++BOOL term_publish_frame(HWND hwnd, const void *rgba, UINT width, UINT height)
++{
++    struct wt_wine_window frame = {0};
++    RECT client;
++    POINT origin = {0};
++    if (!rgba || !width || !height || width > WT_WINE_MAX_WIDTH || height > WT_WINE_MAX_HEIGHT ||
++        !NtUserGetClientRect(hwnd, &client, 96) || !NtUserClientToScreen(hwnd, &origin)) return FALSE;
++    if (client.right - client.left > WT_WINE_MAX_WIDTH ||
++        client.bottom - client.top > WT_WINE_MAX_HEIGHT) return FALSE;
++    OffsetRect(&client, origin.x, origin.y);
++    frame.hwnd = HandleToULong(hwnd);
++    frame.pid = getpid();
++    frame.x = client.left;
++    frame.y = client.top;
++    frame.width = width;
++    frame.height = height;
++    frame.flags = WT_WINE_VISIBLE | WT_WINE_GPU;
++    if (NtUserGetForegroundWindow() == hwnd) frame.flags |= WT_WINE_FOREGROUND;
++    describe_client(&frame, &client);
++    return send_message(WT_WINE_FRAME, &frame, sizeof(frame), rgba, width * height * 4);
++}
++
++static void term_set_clip(struct window_surface *surface, const RECT *rects, UINT count) {}
++static void term_surface_destroy(struct window_surface *surface)
++{
++    struct term_surface *term = (struct term_surface *)surface;
++    free(term->rgba);
++}
++
++static BOOL term_surface_flush(struct window_surface *surface, const RECT *rect, const RECT *dirty,
++                               const BITMAPINFO *info, const void *bits, BOOL shape_changed,
++                               const BITMAPINFO *shape_info, const void *shape_bits)
++{
++    struct term_surface *term = (struct term_surface *)surface;
++    struct wt_wine_window frame;
++    const BITMAPINFOHEADER *bitmap = &info->bmiHeader;
++    const unsigned char *src = bits;
++    unsigned char *rgba;
++    RECT visible, client;
++    BOOL visible_flag, ok;
++    int left, top, right, bottom, width, height, x, y, stride, source_height;
++
++    pthread_mutex_lock(&geometry_mutex);
++    visible = term->visible;
++    client = term->client;
++    visible_flag = term->visible_flag && !has_gpu_client(surface->hwnd);
++    pthread_mutex_unlock(&geometry_mutex);
++    if (!visible_flag) return TRUE;
++    /* An unsupported oversized client must not send invalid metadata and
++     * disconnect other windows sharing this process's terminal connection. */
++    if (client.right - client.left > WT_WINE_MAX_WIDTH ||
++        client.bottom - client.top > WT_WINE_MAX_HEIGHT) return TRUE;
++    if (bitmap->biBitCount != 32 || bitmap->biWidth <= 0 || !bitmap->biHeight) return FALSE;
++    source_height = abs(bitmap->biHeight);
++    left = max(0, max(visible.left, client.left) - visible.left - rect->left);
++    top = max(0, max(visible.top, client.top) - visible.top - rect->top);
++    right = min(bitmap->biWidth, min(visible.right, client.right) - visible.left - rect->left);
++    bottom = min(source_height, min(visible.bottom, client.bottom) - visible.top - rect->top);
++    width = right - left;
++    height = bottom - top;
++    if (width <= 0 || height <= 0) return TRUE;
++    if (width > WT_WINE_MAX_WIDTH || height > WT_WINE_MAX_HEIGHT) return FALSE;
++    if ((size_t)width * height * 4 > term->rgba_capacity)
++    {
++        size_t capacity = (size_t)width * height * 4;
++        if (!(rgba = realloc(term->rgba, capacity))) return FALSE;
++        term->rgba = rgba;
++        term->rgba_capacity = capacity;
++    }
++    rgba = term->rgba;
++    stride = bitmap->biWidth * 4;
++    for (y = 0; y < height; ++y)
++    {
++        int row = bitmap->biHeight < 0 ? top + y : source_height - 1 - top - y;
++        const unsigned char *in = src + (size_t)row * stride + left * 4;
++        unsigned char *out = rgba + (size_t)y * width * 4;
++        for (x = 0; x < width; ++x)
++        {
++            out[x * 4] = in[x * 4 + 2];
++            out[x * 4 + 1] = in[x * 4 + 1];
++            out[x * 4 + 2] = in[x * 4];
++            out[x * 4 + 3] = 255;
++        }
++    }
++    memset(&frame, 0, sizeof(frame));
++    frame.hwnd = HandleToULong(surface->hwnd);
++    frame.pid = getpid();
++    frame.x = visible.left + rect->left + left;
++    frame.y = visible.top + rect->top + top;
++    frame.width = width;
++    frame.height = height;
++    frame.flags = WT_WINE_VISIBLE;
++    describe_client(&frame, &client);
++    if (NtUserGetForegroundWindow() == surface->hwnd) frame.flags |= WT_WINE_FOREGROUND;
++    ok = send_message(WT_WINE_FRAME, &frame, sizeof(frame), rgba, width * height * 4);
++    TRACE("frame hwnd %p %ux%u at %d,%d ok %d\n", surface->hwnd, frame.width, frame.height, frame.x, frame.y, ok);
++    return ok;
++}
++
++static const struct window_surface_funcs term_surface_funcs =
++{
++    .size = sizeof(struct term_surface),
++    .set_clip = term_set_clip,
++    .flush = term_surface_flush,
++    .destroy = term_surface_destroy,
++};
++
++static BOOL term_create_window_surface(HWND hwnd, BOOL layered, const RECT *rect, struct window_surface **surface)
++{
++    BITMAPINFO info = {0};
++    struct window_surface *previous = *surface;
++    int width = rect->right - rect->left, height = rect->bottom - rect->top;
++    if (previous && previous->funcs == &term_surface_funcs) return TRUE;
++    if (width <= 0 || height <= 0 || width > WT_WINE_MAX_WINDOW_WIDTH || height > WT_WINE_MAX_WINDOW_HEIGHT) return FALSE;
++    info.bmiHeader.biSize = sizeof(info.bmiHeader);
++    info.bmiHeader.biWidth = width;
++    info.bmiHeader.biHeight = -height;
++    info.bmiHeader.biPlanes = 1;
++    info.bmiHeader.biBitCount = 32;
++    info.bmiHeader.biCompression = BI_RGB;
++    info.bmiHeader.biSizeImage = width * height * 4;
++    *surface = window_surface_create(&term_surface_funcs, hwnd, rect, &info, 0);
++    if (previous) window_surface_release(previous);
++    TRACE("created hwnd %p surface %p rect %s\n", hwnd, *surface, wine_dbgstr_rect(rect));
++    return *surface != NULL;
++}
++
++static BOOL term_window_pos_changing(HWND hwnd, UINT flags, BOOL shaped, const struct window_rects *rects)
++{
++    return TRUE;
++}
++
++static void term_window_pos_changed(HWND hwnd, HWND insert_after, HWND owner_hint, UINT flags,
++                                    const struct window_rects *rects, struct window_surface *surface)
++{
++    struct wt_wine_window window = {0};
++    BOOL visible = NtUserGetWindowLongW(hwnd, GWL_STYLE) & WS_VISIBLE;
++    HWND parent = NtUserGetAncestor(hwnd, GA_PARENT);
++    if (parent && parent != NtUserGetDesktopWindow()) return;
++    if (surface && surface->funcs == &term_surface_funcs)
++    {
++        struct term_surface *term = (struct term_surface *)surface;
++        pthread_mutex_lock(&geometry_mutex);
++        term->visible = rects->visible;
++        term->client = rects->client;
++        term->visible_flag = visible;
++        pthread_mutex_unlock(&geometry_mutex);
++    }
++    window.hwnd = HandleToULong(hwnd);
++    window.pid = getpid();
++    window.x = rects->visible.left;
++    window.y = rects->visible.top;
++    window.width = max(0, rects->visible.right - rects->visible.left);
++    window.height = max(0, rects->visible.bottom - rects->visible.top);
++    window.flags = visible ? WT_WINE_VISIBLE : 0;
++    describe_client(&window, &rects->client);
++    if (NtUserGetForegroundWindow() == hwnd) window.flags |= WT_WINE_FOREGROUND;
++    if (window.width <= WT_WINE_MAX_WINDOW_WIDTH && window.height <= WT_WINE_MAX_WINDOW_HEIGHT &&
++        window.client_width <= WT_WINE_MAX_WIDTH && window.client_height <= WT_WINE_MAX_HEIGHT)
++        send_message(WT_WINE_WINDOW, &window, sizeof(window), NULL, 0);
++}
++
++static void term_destroy_window(HWND hwnd)
++{
++    struct wt_wine_destroy destroy = {HandleToULong(hwnd), getpid(), 0};
++    UINT i;
++    pthread_mutex_lock(&geometry_mutex);
++    for (i = 0; i < ARRAYSIZE(gpu_windows); ++i)
++        if (gpu_windows[i].hwnd == hwnd) memset(&gpu_windows[i], 0, sizeof(gpu_windows[i]));
++    pthread_mutex_unlock(&geometry_mutex);
++    send_message(WT_WINE_DESTROY, &destroy, sizeof(destroy), NULL, 0);
++}
++
++static BOOL term_create_desktop(const WCHAR *name, UINT width, UINT height)
++{
++    if (width && height && width <= WT_WINE_MAX_WINDOW_WIDTH && height <= WT_WINE_MAX_WINDOW_HEIGHT)
++    {
++        pthread_mutex_lock(&geometry_mutex);
++        desktop_width = width;
++        desktop_height = height;
++        pthread_mutex_unlock(&geometry_mutex);
++    }
++    return TRUE;
++}
++static BOOL term_create_window(HWND hwnd) { return TRUE; }
++static BOOL term_set_cursor_pos(INT x, INT y) { return TRUE; }
++static BOOL term_clip_cursor(const RECT *rect, BOOL reset) { return TRUE; }
++
++static const struct user_driver_funcs term_driver =
++{
++    .pUpdateDisplayDevices = term_update_display_devices,
++    .pChangeDisplaySettings = term_change_display_settings,
++    .pOpenGLInit = TERM_OpenGLInit,
++    .pCreateDesktop = term_create_desktop,
++    .pCreateWindow = term_create_window,
++    .pDestroyWindow = term_destroy_window,
++    .pSetCursorPos = term_set_cursor_pos,
++    .pClipCursor = term_clip_cursor,
++    .pWindowPosChanging = term_window_pos_changing,
++    .pWindowPosChanged = term_window_pos_changed,
++    .pCreateWindowSurface = term_create_window_surface,
++};
++
++static NTSTATUS init(void *unused)
++{
++    struct sockaddr_un address = {0};
++    int send_buffer = 4 * 1024 * 1024;
++    const char *path = getenv("WINETK_SOCKET"), *fps_env = getenv("WINETK_FPS");
++    const char *size_env = getenv("WINETK_DESKTOP_SIZE");
++    if (size_env && *size_env)
++    {
++        char tail;
++        UINT width, height;
++        if (sscanf(size_env, "%ux%u%c", &width, &height, &tail) == 2 &&
++            width >= 64 && height >= 64 && width <= WT_WINE_MAX_WINDOW_WIDTH &&
++            height <= WT_WINE_MAX_WINDOW_HEIGHT)
++        {
++            desktop_width = width;
++            desktop_height = height;
++        }
++    }
++    if (fps_env && *fps_env)
++    {
++        char *end;
++        unsigned long fps = strtoul(fps_env, &end, 10);
++        if (!*end && fps >= 1 && fps <= 240) desktop_frequency = fps;
++    }
++    if (!path || !*path || strlen(path) >= sizeof(address.sun_path)) return STATUS_UNSUCCESSFUL;
++    if ((connection = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0)) == -1) return STATUS_UNSUCCESSFUL;
++    /* Full-frame local transport needs room for several 640x480 frames.
++     * A bounded larger queue avoids GUI stalls while the broker encodes Kitty. */
++    setsockopt(connection, SOL_SOCKET, SO_SNDBUF, &send_buffer, sizeof(send_buffer));
++    address.sun_family = AF_UNIX;
++    strcpy(address.sun_path, path);
++    if (connect(connection, (struct sockaddr *)&address, sizeof(address)) == -1)
++    {
++        WARN("cannot connect to WineTK broker %s: %s\n", path, strerror(errno));
++        close(connection);
++        connection = -1;
++        return STATUS_UNSUCCESSFUL;
++    }
++    __wine_set_user_driver(&term_driver, WINE_GDI_DRIVER_VERSION);
++    TRACE("terminal display driver initialized, %ux%u\n", desktop_width, desktop_height);
++    return STATUS_SUCCESS;
++}
++
++static void send_unicode(HWND hwnd, WORD unit)
++{
++    INPUT event = {0};
++    event.type = INPUT_KEYBOARD;
++    event.ki.wScan = unit;
++    event.ki.dwFlags = KEYEVENTF_UNICODE;
++    NtUserSendHardwareInput(hwnd, 0, &event, 0);
++    event.ki.dwFlags |= KEYEVENTF_KEYUP;
++    NtUserSendHardwareInput(hwnd, 0, &event, 0);
++}
++
++/* The null-driver US keyboard fallback searches numpad entries before their
++ * E0 navigation equivalents even for MAPVK_VK_TO_VSC_EX. Terminal navigation
++ * keys are unambiguous, so retain their physical E0 scans explicitly. */
++static UINT physical_key_scan(UINT key)
++{
++    switch (key)
++    {
++    case VK_PRIOR: return 0xe049;
++    case VK_NEXT: return 0xe051;
++    case VK_END: return 0xe04f;
++    case VK_HOME: return 0xe047;
++    case VK_LEFT: return 0xe04b;
++    case VK_UP: return 0xe048;
++    case VK_RIGHT: return 0xe04d;
++    case VK_DOWN: return 0xe050;
++    case VK_INSERT: return 0xe052;
++    case VK_DELETE: return 0xe053;
++    default: return NtUserMapVirtualKeyEx(key, MAPVK_VK_TO_VSC_EX, 0);
++    }
++}
++
++static NTSTATUS read_events(void *unused)
++{
++    struct wt_wine_header header;
++    struct wt_wine_input input;
++    while (read_bytes(&header, sizeof(header)))
++    {
++        INPUT event = {0};
++        HWND hwnd;
++        if (header.magic != WT_WINE_MAGIC || header.version != WT_WINE_VERSION ||
++            header.type != WT_WINE_INPUT || header.size != sizeof(input) || !read_bytes(&input, sizeof(input))) break;
++        hwnd = ULongToHandle((ULONG)input.hwnd);
++        /* A private same-uid socket is still untrusted input. Never address a
++         * window owned by another Wine process. */
++        if (!hwnd || HandleToULong(NtUserQueryWindow(hwnd, WindowProcess)) != GetCurrentProcessId()) continue;
++        switch (input.kind)
++        {
++        case WT_WINE_FOCUS:
++            if (input.value) NtUserSetForegroundWindow(hwnd);
++            break;
++        case WT_WINE_CLOSE:
++            NtUserPostMessage(hwnd, WM_CLOSE, 0, 0);
++            break;
++        case WT_WINE_KEY:
++        {
++            UINT scan;
++            if (input.code > 255) break;
++            scan = physical_key_scan(input.code);
++            event.type = INPUT_KEYBOARD;
++            event.ki.wVk = input.code;
++            event.ki.wScan = scan & 0xff;
++            event.ki.dwFlags = input.value ? 0 : KEYEVENTF_KEYUP;
++            if (scan & ~0xff) event.ki.dwFlags |= KEYEVENTF_EXTENDEDKEY;
++            /* Wine's keyboard hardware path automatically dispatches RawInput.
++             * Preserve E0/E1 scan prefixes as EXTENDEDKEY so DirectInput sees
++             * arrows/navigation keys instead of their numpad counterparts. */
++            NtUserSendHardwareInput(hwnd, 0, &event, 0);
++            TRACE("key hwnd %p vk %#x scan %#x flags %#x\n", hwnd, input.code, scan, event.ki.dwFlags);
++            break;
++        }
++        case WT_WINE_TEXT:
++            if (input.code > 0x10ffff || (input.code >= 0xd800 && input.code <= 0xdfff)) break;
++            if (input.code > 0xffff)
++            {
++                UINT scalar = input.code - 0x10000;
++                send_unicode(hwnd, 0xd800 + (scalar >> 10));
++                send_unicode(hwnd, 0xdc00 + (scalar & 1023));
++            }
++            else send_unicode(hwnd, input.code);
++            break;
++        case WT_WINE_MOVE:
++        case WT_WINE_BUTTON:
++        case WT_WINE_WHEEL:
++            event.type = INPUT_MOUSE;
++            event.mi.dx = input.x;
++            event.mi.dy = input.y;
++            event.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
++            if (input.kind == WT_WINE_BUTTON)
++            {
++                static const DWORD down[] = {0, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_RIGHTDOWN};
++                static const DWORD up[] = {0, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTUP};
++                if (input.code < 1 || input.code > 3) break;
++                if (input.value) NtUserSetForegroundWindow(hwnd);
++                event.mi.dwFlags |= input.value ? down[input.code] : up[input.code];
++            }
++            else if (input.kind == WT_WINE_WHEEL)
++            {
++                if (input.value < -120 || input.value > 120) break;
++                event.mi.dwFlags |= MOUSEEVENTF_WHEEL;
++                event.mi.mouseData = input.value * WHEEL_DELTA;
++            }
++            NtUserSendHardwareInput(hwnd, SEND_HWMSG_RAWINPUT, &event, 0);
++            event.mi.dwFlags = MOUSEEVENTF_MOVE_NOCOALESCE;
++            NtUserSendHardwareInput(NULL, SEND_HWMSG_RAWINPUT, &event, 0);
++            break;
++        }
++    }
++    return STATUS_SUCCESS;
++}
++
++const unixlib_entry_t __wine_unix_call_funcs[] = {init, read_events};
++C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == term_unix_count);
++#ifdef _WIN64
++const unixlib_entry_t __wine_unix_call_wow64_funcs[] = {init, read_events};
++C_ASSERT(ARRAYSIZE(__wine_unix_call_wow64_funcs) == term_unix_count);
++#endif
+diff --git a/dlls/wineterm.drv/termdrv.h b/dlls/wineterm.drv/termdrv.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..84fd183c7fae8aea9e9ec25adcb0f5d2857e84f3
+--- /dev/null
++++ b/dlls/wineterm.drv/termdrv.h
+@@ -0,0 +1,13 @@
++/* Copyright 2026 WineTK contributors. SPDX-License-Identifier: LGPL-2.1-or-later */
++#ifndef __WINE_TERMDRV_H
++#define __WINE_TERMDRV_H
++
++struct opengl_funcs;
++struct opengl_driver_funcs;
++
++UINT TERM_OpenGLInit(UINT version, const struct opengl_funcs *funcs,
++                    const struct opengl_driver_funcs **driver_funcs);
++BOOL term_publish_frame(HWND hwnd, const void *rgba, UINT width, UINT height);
++void term_set_gpu_active(HWND hwnd, BOOL active);
++
++#endif
+diff --git a/dlls/wineterm.drv/unixlib.h b/dlls/wineterm.drv/unixlib.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..969728ac075ab42a6a381e4bf284f1d1ef42f46d
+--- /dev/null
++++ b/dlls/wineterm.drv/unixlib.h
+@@ -0,0 +1,9 @@
++#ifndef __WINE_TERM_UNIXLIB_H
++#define __WINE_TERM_UNIXLIB_H
++#include <stdarg.h>
++#include "windef.h"
++#include "winbase.h"
++#include "winternl.h"
++#include "wine/unixlib.h"
++enum term_unix_func { term_init, term_read_events, term_unix_count };
++#endif
+diff --git a/include/Makefile.in b/include/Makefile.in
+index 008736e0d8ebd859dd3d8df6e03d2e89edb4fd54..d1873ba5add066404bf62c45bc0c49895cbe3efd 100644
+--- a/include/Makefile.in
++++ b/include/Makefile.in
+@@ -1156,6 +1156,7 @@ SOURCES = \
+ 	wine/winebth.h \
+ 	wine/wined3d.h \
+ 	wine/winedmo.h \
++	wine/winetk_protocol.h \
+ 	wine/winedxgi.idl \
+ 	wine/wingdi16.h \
+ 	wine/winnet16.h \
+diff --git a/include/wine/winetk_protocol.h b/include/wine/winetk_protocol.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..3c6745c1ebff2d94db6a427b2975e7e9fbc2759a
+--- /dev/null
++++ b/include/wine/winetk_protocol.h
+@@ -0,0 +1,74 @@
++#ifndef WINETK_WINE_PROTOCOL_H
++#define WINETK_WINE_PROTOCOL_H
++
++#include <stdint.h>
++
++/* Local, little-endian Unix stream protocol. size is payload bytes, excluding
++ * this header. No pointers, native handles, or architecture-dependent fields. */
++#define WT_WINE_MAGIC 0x4b544957u
++#define WT_WINE_VERSION 2u
++#define WT_WINE_MAX_WIDTH 1920u
++#define WT_WINE_MAX_HEIGHT 1080u
++/* WINDOW metadata may include non-client extents and padded GDI storage. */
++#define WT_WINE_MAX_WINDOW_WIDTH 2048u
++#define WT_WINE_MAX_WINDOW_HEIGHT 1152u
++#define WT_WINE_MAX_PAYLOAD (48u + WT_WINE_MAX_WIDTH * WT_WINE_MAX_HEIGHT * 4u)
++#define WT_WINE_FRAME 1u
++#define WT_WINE_DESTROY 2u
++#define WT_WINE_WINDOW 3u
++#define WT_WINE_INPUT 4u
++#define WT_WINE_VISIBLE 1u
++#define WT_WINE_FOREGROUND 2u
++/* FRAME producer is a GPU drawable; retained across WINDOW geometry updates. */
++#define WT_WINE_GPU 4u
++#define WT_WINE_KEY 1u
++#define WT_WINE_TEXT 2u
++#define WT_WINE_MOVE 3u
++#define WT_WINE_BUTTON 4u
++#define WT_WINE_WHEEL 5u
++#define WT_WINE_FOCUS 6u
++#define WT_WINE_CLOSE 7u
++
++struct wt_wine_header
++{
++    uint32_t magic, version, type, size;
++};
++
++/* FRAME: this structure followed by tightly packed top-down RGBA8 pixels.
++ * WINDOW: this structure only. Coordinates are virtual desktop pixels.
++ * FRAME pixels cover only the client area (excluding Wine non-client decoration).
++ * client_* always describes the full client rectangle in virtual desktop pixels;
++ * x/y/width/height is the transmitted pixel region for FRAME, outer visible rect
++ * for WINDOW. The client origin keeps terminal-to-desktop input mapping exact.
++ * pid is the host getpid(), hwnd is the process's Wine window handle. */
++struct wt_wine_window
++{
++    uint64_t hwnd;
++    uint32_t pid;
++    int32_t x, y;
++    uint32_t width, height, flags;
++    int32_t client_x, client_y;
++    uint32_t client_width, client_height;
++};
++
++struct wt_wine_destroy
++{
++    uint64_t hwnd;
++    uint32_t pid, reserved;
++};
++
++/* KEY: code = Windows virtual key, value = 1 down / 0 up.
++ * TEXT: code = Unicode scalar (synthesized UTF-16 key down/up).
++ * MOVE/BUTTON/WHEEL: x,y = desktop pixels; BUTTON code 1/2/3 = left/middle/right,
++ * value = 1 down / 0 up; WHEEL value = signed vertical wheel steps.
++ * FOCUS with value=1 activates hwnd; value=0 is a focus-loss notification; CLOSE posts WM_CLOSE. modifiers is reserved, zero.
++ * The connection identifies the target process; hwnd must belong to it. */
++struct wt_wine_input
++{
++    uint64_t hwnd;
++    uint32_t kind, code;
++    int32_t x, y, value;
++    uint32_t modifiers;
++};
++
++#endif
